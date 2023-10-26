@@ -5,7 +5,7 @@ import argparse
 from copy import deepcopy
 from os.path import join,isfile
 # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-from time import time, clock
+from time import time, process_time
 import torch
 from torch.utils.data import DataLoader
 import cv2
@@ -15,20 +15,27 @@ import numpy as np
 
 from feature_extractor import Extractor_base
 from blocks import POOL
+from prettytable import PrettyTable
+
+from datasets import NordlandDataset, PittsburgDataset, MapillaryDataset
+
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 parser = argparse.ArgumentParser(description='pytorch-NetVlad')
 ## hyper-param
-parser.add_argument('--N', default=100, type=int, help='re-ranking for top N')
+parser.add_argument('--N', default=25, type=int, help='re-ranking for top N')
 parser.add_argument('--threshold', default=0.02, type=float,
                     help='threshold for patch descriptor filtering')
-parser.add_argument('--checkpoint', default=None, 
+parser.add_argument('--checkpoint', default='/root/TransVPR-model-implementation/TransVPR_MSLS.pth', 
                     type=str, metavar='PATH',
                     help='path to latest checkpoint')
 parser.add_argument('-b','--BatchSize', type=int, default=8, 
                     help='Batch size for testing')
 parser.add_argument('--dataset', type=str, default='msls_val', 
-                    choices = ['msls_val', 'msls_test'],
+                    choices = ['msls_val', 'msls_test', 'nordland', 'pittsburgh'],
                     help='Test dataset to use')
 parser.add_argument('--layer', type=int, default=3, 
                     help='local feature extract layer')
@@ -97,7 +104,7 @@ def predict(eval_set, q_offset):
     with torch.no_grad():
         print('====> Extracting Features')
         torch.cuda.synchronize()
-        time_begin = clock()
+        time_begin = process_time()
         for iteration, (input, indices) in enumerate(test_data_loader, 1):
             if (not opt.nocuda) and torch.cuda.is_available():
                 input = input.cuda(opt.gpu_id, non_blocking=True)
@@ -117,7 +124,7 @@ def predict(eval_set, q_offset):
                     len(test_data_loader)), flush=True)
             del input, feature, encoding, mask
     torch.cuda.synchronize()
-    total_sec = (clock() - time_begin)
+    total_sec = (process_time() - time_begin)
     print(f'[Feature extraction] \t  Time: {total_sec:.2f}') 
     del test_data_loader
     torch.cuda.empty_cache()
@@ -136,7 +143,7 @@ def predict(eval_set, q_offset):
     faiss_index_gpu.add(dbFeat)
 
     print('====> Ranking')
-    time_begin = clock()
+    time_begin = process_time()
     _, predictions = faiss_index_gpu.search(qFeat, opt.N) 
     predictions_local = deepcopy(predictions)
     
@@ -150,20 +157,113 @@ def predict(eval_set, q_offset):
         predictions_local[qIx][:opt.N] = pred[i]
         if qIx % 100 == 0:
             print("==> Number ({}/{})".format(qIx,len(predictions)), flush=True)
-    total_sec = (clock() - time_begin)
+    total_sec = (process_time() - time_begin)
     print(f'[Retrieval] \t  Time: {total_sec:.2f}') 
     return predictions.cpu().numpy(), predictions_local.cpu().numpy()
 
 
 def test_msls(subset):
-    import msls as msls
-    if subset == 'val':
-        eval_set = msls.MSLS_ValSet(img_size=tuple(img_size))
-    elif subset =='test':
-        eval_set = msls.MSLS_TestSet(img_size=tuple(img_size))
+    # import msls as msls
+    # if subset == 'val':
+    #     eval_set = msls.MSLS_ValSet(img_size=tuple(img_size))
+    # elif subset =='test':
+    #     eval_set = msls.MSLS_TestSet(img_size=tuple(img_size))
     
-    predictions_global, predictions_local = predict(eval_set, eval_set.q_offset)
+    # predictions_global, predictions_local = predict(eval_set, eval_set.q_offset)
+    # return predictions_global, predictions_local
+    eval_set = MapillaryDataset.MSLS()
+    
+    predictions_global, predictions_local = predict(eval_set, eval_set.num_references)
+
+    # start calculating recall_at_k
+    k_values = [1, 5, 10, 15, 20, 25]
+    gt = eval_set.pIdx
+    correct_at_k = np.zeros(len(k_values))
+    for q_idx, pred in enumerate(predictions_local):
+        for i, n in enumerate(k_values):
+            # if in top N then also in top NN, where NN > N
+            if np.any(np.in1d(pred[:n], gt[q_idx])):
+                correct_at_k[i:] += 1
+                break
+    
+    correct_at_k = correct_at_k / len(predictions_local)
+    d = {k:v for (k,v) in zip(k_values, correct_at_k)}
+
+    print() # print a new line
+    table = PrettyTable()
+    table.field_names = ['K']+[str(k) for k in k_values]
+    table.add_row(['Recall@K']+ [f'{100*v:.2f}' for v in correct_at_k])
+    print(table.get_string(title=f"Performances on {opt.dataset}"))
+
     return predictions_global, predictions_local
+
+def test_nordland():
+    # import msls as msls
+    # if subset == 'val':
+    #     eval_set = msls.MSLS_ValSet(img_size=tuple(img_size))
+    # elif subset =='test':
+    #     eval_set = msls.MSLS_TestSet(img_size=tuple(img_size))
+    eval_set = NordlandDataset.NordlandDataset()
+    
+    predictions_global, predictions_local = predict(eval_set, eval_set.num_references)
+
+    # start calculating recall_at_k
+    k_values = [1, 5, 10, 15, 20, 25]
+    gt = eval_set.ground_truth
+    correct_at_k = np.zeros(len(k_values))
+    for q_idx, pred in enumerate(predictions_local):
+        for i, n in enumerate(k_values):
+            # if in top N then also in top NN, where NN > N
+            if np.any(np.in1d(pred[:n], gt[q_idx])):
+                correct_at_k[i:] += 1
+                break
+    
+    correct_at_k = correct_at_k / len(predictions_local)
+    d = {k:v for (k,v) in zip(k_values, correct_at_k)}
+
+    print() # print a new line
+    table = PrettyTable()
+    table.field_names = ['K']+[str(k) for k in k_values]
+    table.add_row(['Recall@K']+ [f'{100*v:.2f}' for v in correct_at_k])
+    print(table.get_string(title=f"Performances on {opt.dataset}"))
+
+    return predictions_global, predictions_local
+
+def test_pittsburgh():
+    val_datasets = ['pittsburgh250k']
+    for subset in val_datasets:
+        # if subset == 'val':
+        #     eval_set = msls.MSLS_ValSet(img_size=tuple(img_size))
+        # elif subset =='test':
+        #     eval_set = msls.MSLS_TestSet(img_size=tuple(img_size))
+        if subset == 'pittsburgh250k':
+            eval_set = PittsburgDataset.get_250k_test_set()
+        elif subset == 'pittsburgh30k':
+            eval_set = PittsburgDataset.get_whole_test_set()
+        
+        predictions_global, predictions_local = predict(eval_set, eval_set.dbStruct.numDb)
+
+        # start calculating recall_at_k
+        k_values = [1, 5, 10, 15, 20, 25]
+        gt = eval_set.getPositives()
+        correct_at_k = np.zeros(len(k_values))
+        for q_idx, pred in enumerate(predictions_local):
+            for i, n in enumerate(k_values):
+                # if in top N then also in top NN, where NN > N
+                if np.any(np.in1d(pred[:n], gt[q_idx])):
+                    correct_at_k[i:] += 1
+                    break
+        
+        correct_at_k = correct_at_k / len(predictions_local)
+        d = {k:v for (k,v) in zip(k_values, correct_at_k)}
+
+        print() # print a new line
+        table = PrettyTable()
+        table.field_names = ['K']+[str(k) for k in k_values]
+        table.add_row(['Recall@K']+ [f'{100*v:.2f}' for v in correct_at_k])
+        print(table.get_string(title=f"Performances on {subset}"))
+
+    # return predictions_global, predictions_local
 
 
 if __name__ == "__main__":
@@ -199,10 +299,15 @@ if __name__ == "__main__":
     begin = time()
     if opt.dataset == 'msls_val':
         predictions_global, predictions_local = test_msls('val')
-    elif opt.dataset == 'msls_test':
-        predictions_global, predictions_local = test_msls('test')
+    # elif opt.dataset == 'msls_test':
+    #     predictions_global, predictions_local = test_msls('test')
+    elif opt.dataset == 'nordland':
+        predictions_global, predictions_local = test_nordland()
+    elif opt.dataset == 'pittsburgh':
+        test_pittsburgh()
     total_mins = (time() - begin) / 60
-    print(f'[Test] \t  Time: {total_mins:.2f}')    
+    print(f'[Test] \t  Time: {total_mins:.2f}')
+
     
     
     
