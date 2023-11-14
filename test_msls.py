@@ -20,8 +20,8 @@ from prettytable import PrettyTable
 from datasets import NordlandDataset, PittsburgDataset, MapillaryDataset
 
 import os
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 parser = argparse.ArgumentParser(description='pytorch-NetVlad')
@@ -29,12 +29,12 @@ parser = argparse.ArgumentParser(description='pytorch-NetVlad')
 parser.add_argument('--N', default=25, type=int, help='re-ranking for top N')
 parser.add_argument('--threshold', default=0.02, type=float,
                     help='threshold for patch descriptor filtering')
-parser.add_argument('--checkpoint', default='/root/TransVPR-model-implementation/TransVPR_MSLS.pth', 
+parser.add_argument('--checkpoint', default='/root/TransVPR-model-implementation/TransVPR_Pitts30k.pth', 
                     type=str, metavar='PATH',
                     help='path to latest checkpoint')
-parser.add_argument('-b','--BatchSize', type=int, default=8, 
+parser.add_argument('-b','--BatchSize', type=int, default=64, 
                     help='Batch size for testing')
-parser.add_argument('--dataset', type=str, default='msls_val', 
+parser.add_argument('--dataset', type=str, default='pittsburgh', 
                     choices = ['msls_val', 'msls_test', 'nordland', 'pittsburgh'],
                     help='Test dataset to use')
 parser.add_argument('--layer', type=int, default=3, 
@@ -106,10 +106,12 @@ def predict(eval_set, q_offset):
         torch.cuda.synchronize()
         time_begin = process_time()
         for iteration, (input, indices) in enumerate(test_data_loader, 1):
+            print("PRE", iteration)
             if (not opt.nocuda) and torch.cuda.is_available():
                 input = input.cuda(opt.gpu_id, non_blocking=True)
             feature = model(input)
-            encoding, mask = model.pool(feature)    
+            encoding, mask = model.pool(feature)   
+            print("CAL FEAT:", iteration, feature.shape) 
             
             Feat[indices.detach(), :] = encoding.detach().cpu()
             Feat_local[indices.detach(), :] = feature[:,opt.layer,1:,:].detach().cpu()
@@ -122,12 +124,14 @@ def predict(eval_set, q_offset):
             if iteration % 50 == 0 or len(test_data_loader) <= 10:
                 print("==> Batch ({}/{})".format(iteration, 
                     len(test_data_loader)), flush=True)
+            # print('FEAT:', iteration, Feat.shape)
             del input, feature, encoding, mask
     torch.cuda.synchronize()
     total_sec = (process_time() - time_begin)
     print(f'[Feature extraction] \t  Time: {total_sec:.2f}') 
     del test_data_loader
     torch.cuda.empty_cache()
+    # print('FEAT:',Feat)
     
     qFeat = Feat[q_offset:]
     dbFeat = Feat[:q_offset]
@@ -146,6 +150,7 @@ def predict(eval_set, q_offset):
     time_begin = process_time()
     _, predictions = faiss_index_gpu.search(qFeat, opt.N) 
     predictions_local = deepcopy(predictions)
+    # print("PRED LOCAL:", predictions_local)
     
     print('====> Reranking')
     for qIx, pred in enumerate(predictions):
@@ -153,6 +158,7 @@ def predict(eval_set, q_offset):
                                     dbFeat_local[pred[:opt.N]].cuda(), 
                                     qMask[qIx].cuda(), dbMask[pred[:opt.N]].cuda(),
                                     tuple(img_size), opt.threshold)
+        # print('SCORES:', scores)
         i = np.argsort(scores)[::-1].copy() #score: higher => better
         predictions_local[qIx][:opt.N] = pred[i]
         if qIx % 100 == 0:
